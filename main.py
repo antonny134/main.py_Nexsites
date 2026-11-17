@@ -22,6 +22,7 @@ DATA_DIR = Path(os.environ.get("NEXSITES_DATA_DIR", ROOT_DIR / "data"))
 SITES_FILE = DATA_DIR / "sites.json"
 USERS_FILE = DATA_DIR / "users.json"
 COMMENTS_FILE = DATA_DIR / "comments.json"
+FOLLOWS_FILE = DATA_DIR / "follows.json"
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret").encode("utf-8")
 TOKEN_LIFETIME_SECONDS = 8 * 60 * 60
 
@@ -49,13 +50,14 @@ def save_records(file_path: Path, records: list[dict[str, Any]]) -> None:
 
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-for data_file in (SITES_FILE, USERS_FILE, COMMENTS_FILE):
+for data_file in (SITES_FILE, USERS_FILE, COMMENTS_FILE, FOLLOWS_FILE):
     if not data_file.exists():
         data_file.write_text("[]", encoding="utf-8")
 
 database: list[dict[str, Any]] = read_records(SITES_FILE)
 users: list[dict[str, Any]] = read_records(USERS_FILE)
 comments: list[dict[str, Any]] = read_records(COMMENTS_FILE)
+follows: list[dict[str, Any]] = read_records(FOLLOWS_FILE)
 
 app = FastAPI()
 app.add_middleware(
@@ -153,6 +155,33 @@ def persist_comments() -> None:
     save_records(COMMENTS_FILE, comments)
 
 
+def persist_follows() -> None:
+    save_records(FOLLOWS_FILE, follows)
+
+
+def with_views(site: dict[str, Any]) -> dict[str, Any]:
+    return {**site, "views": site.get("views", 0)}
+
+
+def newest_first(sites: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(sites, key=lambda site: str(site.get("createdAt", "")), reverse=True)
+
+
+def clean_text(value: Any, max_length: int) -> str:
+    return str(value or "").strip()[:max_length]
+
+
+def clean_tags(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    tags: list[str] = []
+    for item in value:
+        tag = clean_text(item, 20).lower().lstrip("#")
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags[:5]
+
+
 @app.get("/")
 def home() -> FileResponse:
     return FileResponse(ROOT_DIR / "index.html")
@@ -167,14 +196,22 @@ def register(account: dict[str, Any]) -> dict[str, bool]:
     if not isinstance(password, str) or not password:
         raise HTTPException(status_code=400, detail="password required")
     username = username.strip()
-    if any(user.get("username") == username for user in users):
+    if any(
+        str(user.get("username", "")).lower() == username.lower() for user in users
+    ):
         raise HTTPException(status_code=400, detail="user exists")
 
     password_hash = bcrypt.hashpw(
         password.encode("utf-8")[:72],
         bcrypt.gensalt(rounds=12),
     ).decode("ascii")
-    users.append({"username": username, "passwordHash": password_hash})
+    users.append(
+        {
+            "username": username,
+            "passwordHash": password_hash,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     save_records(USERS_FILE, users)
     return {"ok": True}
 
@@ -206,9 +243,16 @@ def login(credentials: dict[str, Any]) -> dict[str, str]:
     return {"token": create_token(username)}
 
 
+@app.get("/api/users")
+def list_users() -> list[str]:
+    """Nomes de todas as pessoas cadastradas (nunca expõe senhas/hashes)."""
+    return [str(user["username"]) for user in users if user.get("username")]
+
+
 @app.get("/api/sites")
 def list_sites() -> list[dict[str, Any]]:
-    return [{**site, "views": site.get("views", 0)} for site in database]
+    """Tudo que todo mundo postou, do mais recente para o mais antigo."""
+    return [with_views(site) for site in newest_first(database)]
 
 
 @app.post("/api/sites")
@@ -230,9 +274,14 @@ def create_site(
     ]
     site = {
         "id": max(numeric_ids, default=0) + 1,
-        "nome": nome.strip(),
-        "url": url.strip(),
-        "descri": str(site_data.get("descri") or "").strip(),
+        "nome": clean_text(nome, 50),
+        "url": clean_text(url, 300),
+        "descri": clean_text(site_data.get("descri"), 140),
+        "categoria": clean_text(site_data.get("categoria"), 60),
+        "idioma": clean_text(site_data.get("idioma"), 30),
+        "detalhes": clean_text(site_data.get("detalhes"), 600),
+        "repo": clean_text(site_data.get("repo"), 300),
+        "tags": clean_tags(site_data.get("tags")),
         "owner": username,
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "likes": 0,
@@ -241,9 +290,6 @@ def create_site(
         "dislikedBy": [],
         "views": 0,
     }
-    for field in ("categoria", "idioma", "detalhes", "repo", "tags"):
-        if field in site_data:
-            site[field] = site_data[field]
 
     database.insert(0, site)
     persist_sites()
@@ -275,24 +321,29 @@ def delete_site(
 
 @app.get("/api/sites/search")
 def search_sites(q: str = Query(default="")) -> list[dict[str, Any]]:
-    query = q.lower()
+    query = q.lower().strip()
     matching_sites = [
-        {**site, "views": site.get("views", 0)}
-        for site in database
+        with_views(site)
+        for site in newest_first(database)
         if query in str(site.get("nome", "")).lower()
         or query in str(site.get("descri", "")).lower()
+        or query in str(site.get("categoria", "")).lower()
+        or query in str(site.get("owner", "")).lower()
+        or any(query in str(tag).lower() for tag in site.get("tags", []) or [])
     ]
     return matching_sites
 
 
 @app.get("/api/sites/popular")
-def popular_sites() -> list[dict[str, Any]]:
+def popular_sites(limit: int | None = Query(default=None, ge=1)) -> list[dict[str, Any]]:
     sorted_sites = sorted(
         database,
         key=lambda site: site.get("likes", 0),
         reverse=True,
     )
-    return [{**site, "views": site.get("views", 0)} for site in sorted_sites[:10]]
+    if limit is not None:
+        sorted_sites = sorted_sites[:limit]
+    return [with_views(site) for site in sorted_sites]
 
 
 def change_reaction(site_id: str, username: str, reaction: str) -> dict[str, Any]:
@@ -411,6 +462,45 @@ def reply_to_comment(
     return comment
 
 
+@app.get("/api/follows")
+def list_follows() -> list[dict[str, Any]]:
+    """Quem segue quem: [{seguidor, seguido, createdAt}]."""
+    return follows
+
+
+@app.post("/api/follows")
+def set_follow(
+    follow_data: dict[str, Any],
+    username: str = Depends(current_username),
+) -> dict[str, Any]:
+    target = follow_data.get("seguido")
+    if not isinstance(target, str) or not target.strip():
+        raise HTTPException(status_code=400, detail="seguido required")
+    target = target.strip()
+    if target.lower() == username.lower():
+        raise HTTPException(status_code=400, detail="cannot follow yourself")
+
+    active = bool(follow_data.get("ativo", True))
+    follows[:] = [
+        item
+        for item in follows
+        if not (
+            str(item.get("seguidor", "")).lower() == username.lower()
+            and str(item.get("seguido", "")).lower() == target.lower()
+        )
+    ]
+    if active:
+        follows.append(
+            {
+                "seguidor": username,
+                "seguido": target,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    persist_follows()
+    return {"ok": True, "seguindo": active}
+
+
 @app.get("/favicon.ico")
 def favicon() -> JSONResponse:
     return JSONResponse(status_code=204, content=None)
@@ -421,8 +511,4 @@ if (ROOT_DIR / "img").is_dir():
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="127.0.0.1",
-        port=int(os.environ.get("PORT", "8000")),
-    )
+    uvicorn.run(app,host="127.0.0.1",port=int(os.environ.get("PORT", "8000")),)
